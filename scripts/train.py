@@ -17,6 +17,10 @@ from src.data.split import walk_forward_splits
 from src.features.build import build_features
 from src.models.ensemble.xgb import make_xgb_model
 from src.models.experimental.transformer import TransformerEncoderRegressor
+from src.evaluation.metrics import regression_metrics, directional_metrics
+from src.evaluation.backtest import backtest_summary
+from src.evaluation.backtest import buy_and_hold_summary
+
 
 import random
 import os
@@ -29,6 +33,25 @@ def set_seed(seed=42):
     os.environ["PYTHONHASHSEED"] = str(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+def _ensure_1d(a):
+    return np.asarray(a).reshape(-1)
+
+def evaluate_all(y_true, y_pred, fold_id, train_n, test_n):
+    y_true = _ensure_1d(y_true)
+    y_pred = _ensure_1d(y_pred)
+
+    reg = regression_metrics(y_true, y_pred)
+    direc = directional_metrics(y_true, y_pred)
+    bt = backtest_summary(y_true, y_pred, risk_free=0.0, threshold=0.0)
+
+    print(
+        f"Fold {fold_id:02d} | Train={train_n} Test={test_n} | "
+        f"RMSE={reg['rmse']:.6f} | MAE={reg['mae']:.6f} | "
+        f"DirAcc={direc['directional_accuracy']:.3f} | F1={direc['f1']:.3f} | "
+        f"Sharpe={bt['sharpe']:.3f} | MaxDD={bt['max_drawdown']:.3f}"
+    )
+    return {**reg, **direc, **bt}
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -113,15 +136,16 @@ def main():
 
     fold_rmses = []
 
+    fold_metrics = []   # NEW: store dict per fold (rmse/mae/diracc/sharpe/maxdd/...)
+
     for fold_id, (train_idx, test_idx) in enumerate(splits, start=1):
         X_train, y_train = X.iloc[train_idx], y[train_idx]
         X_test, y_test = X.iloc[test_idx], y[test_idx]
 
-        # 5. preprocess  
+        # preprocess
         preprocess_cfg = cfg.get("preprocess", {})
         scale = preprocess_cfg.get("scale", "none")
 
-        # XGBoost / tree models generally don't need scaling
         model_name = cfg.get("model", {}).get("name", "ridge")
         if model_name in ("xgboost", "random_forest", "lightgbm"):
             scale = "none"
@@ -134,15 +158,23 @@ def main():
             X_train_t = X_train.values
             X_test_t = X_test.values
 
-        # 6. train model  
+        # train model
         model_name = cfg["model"]["name"]
         model_params = cfg["model"].get("params", {})
 
+        did_manual_training = False  # NEW: torch models set this True
+        y_true = None               # NEW
+        y_pred = None               # NEW
+
         if model_name == "ridge":
             model = make_model(**model_params)
+
         elif model_name == "xgboost":
             model = make_xgb_model(model_params)
+
         elif model_name == "lstm":
+            did_manual_training = True
+
             # ---------- config ----------
             p = model_params
             seq_len = int(p.get("seq_len", 10))
@@ -162,12 +194,10 @@ def main():
                 device = torch.device(device_cfg)
 
             # ---------- scaling (fit only on train) ----------
-            # X scaling (fit only on train)
             x_scaler = StandardScaler()
             X_train_s = x_scaler.fit_transform(X_train).astype("float32")
             X_test_s  = x_scaler.transform(X_test).astype("float32")
 
-            # y scaling (fit only on train)
             y_scaler = StandardScaler()
             y_train_s = y_scaler.fit_transform(y_train.reshape(-1, 1)).astype("float32").ravel()
             y_test_s  = y_scaler.transform(y_test.reshape(-1, 1)).astype("float32").ravel()
@@ -176,75 +206,58 @@ def main():
             Xtr_seq, ytr_seq = make_sequences(X_train_s, y_train_s, seq_len=seq_len)
             Xte_seq, yte_seq = make_sequences(X_test_s,  y_test_s,  seq_len=seq_len)
 
-
             train_ds = TensorDataset(torch.from_numpy(Xtr_seq), torch.from_numpy(ytr_seq))
-            test_ds = TensorDataset(torch.from_numpy(Xte_seq), torch.from_numpy(yte_seq))
+            test_ds  = TensorDataset(torch.from_numpy(Xte_seq), torch.from_numpy(yte_seq))
 
             train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False, drop_last=False)
-            test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+            test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, drop_last=False)
 
             # ---------- model ----------
-            model = LSTMRegressor(
+            model_t = LSTMRegressor(
                 input_dim=Xtr_seq.shape[-1],
                 hidden_dim=hidden_dim,
                 num_layers=num_layers,
                 dropout=dropout,
             ).to(device)
 
-            optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+            optimizer = torch.optim.Adam(model_t.parameters(), lr=lr, weight_decay=weight_decay)
             loss_fn = torch.nn.MSELoss()
 
             # ---------- train ----------
-            model.train()
+            model_t.train()
             for ep in range(1, epochs + 1):
-                total_loss = 0.0
-                n_obs = 0
-
                 for xb, yb in train_loader:
                     xb = xb.to(device)
                     yb = yb.to(device)
 
                     optimizer.zero_grad()
-                    pred = model(xb)
+                    pred = model_t(xb)
                     loss = loss_fn(pred, yb)
                     loss.backward()
 
                     if grad_clip is not None and grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                        torch.nn.utils.clip_grad_norm_(model_t.parameters(), max_norm=grad_clip)
 
                     optimizer.step()
 
-                    total_loss += loss.item() * xb.size(0)
-                    n_obs += xb.size(0)
-                # print(f"Epoch {ep:02d}/{epochs} | train_mse={total_loss/max(n_obs,1):.6f}")
-
-            # ---------- eval ----------
-            model.eval()
+            # ---------- eval (scaled space) ----------
+            model_t.eval()
             preds_all = []
             with torch.no_grad():
                 for xb, _ in test_loader:
                     xb = xb.to(device)
-                    pred = model(xb).detach().cpu().numpy()
+                    pred = model_t(xb).detach().cpu().numpy()
                     preds_all.append(pred)
 
-            # concat predictions (still in scaled y space)
             preds_scaled = np.concatenate(preds_all, axis=0).reshape(-1, 1)
 
             # inverse transform back to original y scale
-            preds_inv = y_scaler.inverse_transform(preds_scaled).ravel()
-            yte_inv = y_scaler.inverse_transform(yte_seq.reshape(-1, 1)).ravel()
+            y_pred = y_scaler.inverse_transform(preds_scaled).ravel()
+            y_true = y_scaler.inverse_transform(yte_seq.reshape(-1, 1)).ravel()
 
-            # compute RMSE on original scale
-            rmse = np.sqrt(mean_squared_error(yte_inv, preds_inv))
-
-            fold_rmses.append(rmse)
-
-            print(
-                f"Fold {fold_id:02d} | Train={len(train_idx)} Test={len(test_idx)} "
-                f"(LSTM eval n={len(yte_seq)}) | RMSE={rmse:.6f}"
-            )
-            continue  # skip the rest of the loop
         elif model_name == "transformer":
+            did_manual_training = True
+
             p = model_params
             seq_len = int(p.get("seq_len", 10))
             d_model = int(p.get("d_model", 64))
@@ -265,17 +278,16 @@ def main():
             else:
                 device = torch.device(device_cfg)
 
-            # ---------- scale X (fit only on train) ----------
+            # ---------- scaling ----------
             x_scaler = StandardScaler()
             X_train_s = x_scaler.fit_transform(X_train).astype("float32")
             X_test_s  = x_scaler.transform(X_test).astype("float32")
 
-            # ---------- scale y (fit only on train) ----------
             y_scaler = StandardScaler()
             y_train_s = y_scaler.fit_transform(y_train.reshape(-1, 1)).astype("float32").ravel()
             y_test_s  = y_scaler.transform(y_test.reshape(-1, 1)).astype("float32").ravel()
 
-            # ---------- build sequences ----------
+            # ---------- sequences ----------
             Xtr_seq, ytr_seq = make_sequences(X_train_s, y_train_s, seq_len=seq_len)
             Xte_seq, yte_seq = make_sequences(X_test_s,  y_test_s,  seq_len=seq_len)
 
@@ -286,7 +298,7 @@ def main():
             test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, drop_last=False)
 
             # ---------- model ----------
-            model = TransformerEncoderRegressor(
+            model_t = TransformerEncoderRegressor(
                 input_dim=Xtr_seq.shape[-1],
                 d_model=d_model,
                 nhead=nhead,
@@ -296,70 +308,86 @@ def main():
                 pooling=pooling,
             ).to(device)
 
-            optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+            optimizer = torch.optim.AdamW(model_t.parameters(), lr=lr, weight_decay=weight_decay)
             loss_fn = torch.nn.MSELoss()
 
             # ---------- train ----------
-            model.train()
+            model_t.train()
             for ep in range(1, epochs + 1):
                 for xb, yb in train_loader:
                     xb = xb.to(device)
                     yb = yb.to(device)
 
                     optimizer.zero_grad()
-                    pred = model(xb)
+                    pred = model_t(xb)
                     loss = loss_fn(pred, yb)
                     loss.backward()
 
                     if grad_clip is not None and grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                        torch.nn.utils.clip_grad_norm_(model_t.parameters(), max_norm=grad_clip)
 
                     optimizer.step()
 
-            # ---------- eval (predict in scaled y space) ----------
-            model.eval()
+            # ---------- eval ----------
+            model_t.eval()
             preds_all = []
             with torch.no_grad():
                 for xb, _ in test_loader:
                     xb = xb.to(device)
-                    pred = model(xb).detach().cpu().numpy()
+                    pred = model_t(xb).detach().cpu().numpy()
                     preds_all.append(pred)
 
             preds_scaled = np.concatenate(preds_all, axis=0).reshape(-1, 1)
 
-            # inverse-transform back to original y scale for RMSE comparability
-            preds_inv = y_scaler.inverse_transform(preds_scaled).ravel()
-            yte_inv   = y_scaler.inverse_transform(yte_seq.reshape(-1, 1)).ravel()
-
-            rmse = np.sqrt(mean_squared_error(yte_inv, preds_inv))
-            fold_rmses.append(rmse)
-
-            print(
-                f"Fold {fold_id:02d} | Train={len(train_idx)} Test={len(test_idx)} "
-                f"(Transformer eval n={len(yte_seq)}) | RMSE={rmse:.6f}"
-            )
-
-            continue
+            y_pred = y_scaler.inverse_transform(preds_scaled).ravel()
+            y_true = y_scaler.inverse_transform(yte_seq.reshape(-1, 1)).ravel()
 
         else:
             raise ValueError(f"Unknown model name: {model_name}")
 
-        model.fit(X_train_t, y_train)
+        # ---- sklearn branch fit/predict (only if not torch-trained) ----
+        if not did_manual_training:
+            model.fit(X_train_t, y_train)
+            preds = model.predict(X_test_t)
+            y_true = y_test
+            y_pred = preds
 
-        # 7. eval  
-        preds = model.predict(X_test_t)
-        rmse = np.sqrt(mean_squared_error(y_test, preds))
-        fold_rmses.append(rmse)
+        # ---- unified evaluation (all models) ----
+        reg = regression_metrics(y_true, y_pred)
+        direc = directional_metrics(y_true, y_pred)
+        bt = backtest_summary(y_true, y_pred, risk_free=0.0, threshold=0.0)
+        if fold_id == 1:
+            bh_baseline = buy_and_hold_summary(y_true, risk_free=0.0)
 
-        print(f"Fold {fold_id:02d} | Train={len(train_idx)} Test={len(test_idx)} | RMSE={rmse:.6f}")
+        fold_metrics.append({**reg, **direc, **bt})
+
+        print(
+            f"Fold {fold_id:02d} | Train={len(train_idx)} Test={len(test_idx)} | "
+            f"RMSE={reg['rmse']:.6f} | MAE={reg['mae']:.6f} | "
+            f"DirAcc={direc['directional_accuracy']:.3f} | F1={direc['f1']:.3f} | "
+            f"Sharpe={bt['sharpe']:.3f} | MaxDD={bt['max_drawdown']:.3f}"
+        )
+
+
+    rmses = [m["rmse"] for m in fold_metrics]
 
     print("=" * 50)
     print(f"Walk-forward {model_name.upper()} Summary")
     print(f"Samples used : {n}")
-    print(f"Folds        : {len(fold_rmses)}")
-    print(f"RMSE mean    : {np.mean(fold_rmses):.6f}")
-    print(f"RMSE std     : {np.std(fold_rmses, ddof=1):.6f}" if len(fold_rmses) > 1 else "RMSE std     : n/a")
+    print(f"Folds        : {len(rmses)}")
+    print(f"RMSE mean    : {np.mean(rmses):.6f}")
+    print(f"RMSE std     : {np.std(rmses, ddof=1):.6f}" if len(rmses) > 1 else "RMSE std     : n/a")
     print("=" * 50)
+    diraccs = [m["directional_accuracy"] for m in fold_metrics]
+    sharpes = [m["sharpe"] for m in fold_metrics]
+    maxdds  = [m["max_drawdown"] for m in fold_metrics]
+    print(f"DirAcc mean  : {np.mean(diraccs):.3f}")
+    print(f"Sharpe mean  : {np.mean(sharpes):.3f}")
+    print(f"MaxDD mean   : {np.mean(maxdds):.3f}")
+    print("Buy-and-Hold Baseline (Test Window)")
+    print(f"Sharpe mean  : {bh_baseline['sharpe']:.3f}")
+    print(f"MaxDD mean   : {bh_baseline['max_drawdown']:.3f}")
+
 
 if __name__ == "__main__":
     main()
