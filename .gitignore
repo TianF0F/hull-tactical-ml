@@ -15,6 +15,7 @@ data/
 runs/
 artifacts/
 outputs/
+mlruns/
 
 # ===== OS =====
 .DS_Store
