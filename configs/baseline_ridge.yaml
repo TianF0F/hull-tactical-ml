@@ -18,9 +18,13 @@ split:
   min_train_size: 1500 
 
 features:
-  use_numeric_only: true
+  lags: [1, 5]
+  rolling_windows: [5]  
+  rolling_stats: ["mean"]
+  max_missing_ratio: 0.2
   drop_na_rows: true
-  max_missing_ratio: 0.2 
+
+
 
 preprocess:
   scale: standard         
