@@ -16,6 +16,7 @@ from src.models.baseline.linear import make_model
 from src.data.split import walk_forward_splits
 from src.features.build import build_features
 from src.models.ensemble.xgb import make_xgb_model
+from src.models.experimental.transformer import TransformerEncoderRegressor
 
 import random
 import os
@@ -243,6 +244,102 @@ def main():
                 f"(LSTM eval n={len(yte_seq)}) | RMSE={rmse:.6f}"
             )
             continue  # skip the rest of the loop
+        elif model_name == "transformer":
+            p = model_params
+            seq_len = int(p.get("seq_len", 10))
+            d_model = int(p.get("d_model", 64))
+            nhead = int(p.get("nhead", 4))
+            num_layers = int(p.get("num_layers", 2))
+            dim_feedforward = int(p.get("dim_feedforward", 128))
+            dropout = float(p.get("dropout", 0.1))
+            pooling = str(p.get("pooling", "last"))
+            lr = float(p.get("lr", 1e-3))
+            weight_decay = float(p.get("weight_decay", 0.0))
+            batch_size = int(p.get("batch_size", 64))
+            epochs = int(p.get("epochs", 20))
+            grad_clip = float(p.get("grad_clip", 1.0))
+            device_cfg = str(p.get("device", "auto")).lower()
+
+            if device_cfg == "auto":
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            else:
+                device = torch.device(device_cfg)
+
+            # ---------- scale X (fit only on train) ----------
+            x_scaler = StandardScaler()
+            X_train_s = x_scaler.fit_transform(X_train).astype("float32")
+            X_test_s  = x_scaler.transform(X_test).astype("float32")
+
+            # ---------- scale y (fit only on train) ----------
+            y_scaler = StandardScaler()
+            y_train_s = y_scaler.fit_transform(y_train.reshape(-1, 1)).astype("float32").ravel()
+            y_test_s  = y_scaler.transform(y_test.reshape(-1, 1)).astype("float32").ravel()
+
+            # ---------- build sequences ----------
+            Xtr_seq, ytr_seq = make_sequences(X_train_s, y_train_s, seq_len=seq_len)
+            Xte_seq, yte_seq = make_sequences(X_test_s,  y_test_s,  seq_len=seq_len)
+
+            train_ds = TensorDataset(torch.from_numpy(Xtr_seq), torch.from_numpy(ytr_seq))
+            test_ds  = TensorDataset(torch.from_numpy(Xte_seq), torch.from_numpy(yte_seq))
+
+            train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+            test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, drop_last=False)
+
+            # ---------- model ----------
+            model = TransformerEncoderRegressor(
+                input_dim=Xtr_seq.shape[-1],
+                d_model=d_model,
+                nhead=nhead,
+                num_layers=num_layers,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                pooling=pooling,
+            ).to(device)
+
+            optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+            loss_fn = torch.nn.MSELoss()
+
+            # ---------- train ----------
+            model.train()
+            for ep in range(1, epochs + 1):
+                for xb, yb in train_loader:
+                    xb = xb.to(device)
+                    yb = yb.to(device)
+
+                    optimizer.zero_grad()
+                    pred = model(xb)
+                    loss = loss_fn(pred, yb)
+                    loss.backward()
+
+                    if grad_clip is not None and grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+
+                    optimizer.step()
+
+            # ---------- eval (predict in scaled y space) ----------
+            model.eval()
+            preds_all = []
+            with torch.no_grad():
+                for xb, _ in test_loader:
+                    xb = xb.to(device)
+                    pred = model(xb).detach().cpu().numpy()
+                    preds_all.append(pred)
+
+            preds_scaled = np.concatenate(preds_all, axis=0).reshape(-1, 1)
+
+            # inverse-transform back to original y scale for RMSE comparability
+            preds_inv = y_scaler.inverse_transform(preds_scaled).ravel()
+            yte_inv   = y_scaler.inverse_transform(yte_seq.reshape(-1, 1)).ravel()
+
+            rmse = np.sqrt(mean_squared_error(yte_inv, preds_inv))
+            fold_rmses.append(rmse)
+
+            print(
+                f"Fold {fold_id:02d} | Train={len(train_idx)} Test={len(test_idx)} "
+                f"(Transformer eval n={len(yte_seq)}) | RMSE={rmse:.6f}"
+            )
+
+            continue
 
         else:
             raise ValueError(f"Unknown model name: {model_name}")
