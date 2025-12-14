@@ -1,0 +1,6 @@
+run:
+  name: baseline_ridge
+  seed: 42
+  target_col: TARGET
+  time_col: Date
+  out_dir: runs
