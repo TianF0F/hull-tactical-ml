@@ -1,0 +1,21 @@
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.env
+.ipynb_checkpoints/
+
+# ===== Data (DO NOT COMMIT) =====
+data/
+!data/.gitkeep
+
+# ===== Experiment outputs =====
+runs/
+artifacts/
+outputs/
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
