@@ -35,6 +35,7 @@ LSTM (Sequential Model):
     python -m scripts.train --config configs/lstm.yaml
 
 Transformer:
+
     python -m scripts.train --config configs/transformer.yaml
 ---
 
